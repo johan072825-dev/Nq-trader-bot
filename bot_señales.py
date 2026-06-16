@@ -8,7 +8,7 @@ from datetime import datetime
 # =========================
 # VARIABLES SEGURAS (RENDER)
 # =========================
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 # =========================
@@ -55,7 +55,12 @@ def obtener_datos():
             return None
 
         df = df.reset_index()
-        df.columns = ["Time","Close","High","Low","Open","Volume"]
+
+        df.rename(columns={
+            "Datetime": "Time",
+            "Date": "Time"
+        }, inplace=True)
+
         df["Time"] = pd.to_datetime(df["Time"])
 
         return df.dropna()
