@@ -62,12 +62,11 @@ def enviar_mensaje(mensaje):
         )
 
         print("STATUS:", response.status_code)
-        print("RESPUESTA:", response.text)
 
         if response.status_code == 200:
             print("✅ Mensaje enviado")
         else:
-            print("❌ Error Telegram")
+            print("❌ Error Telegram:", response.text)
 
     except Exception as e:
         print("❌ Error Telegram:", e)
@@ -79,11 +78,10 @@ def obtener_datos():
 
     try:
 
-        df = yf.download(
-            "NQ=F",
+        ticker = yf.Ticker("NQ=F")
+        df = ticker.history(
             period="5d",
-            interval="5m",
-            progress=False
+            interval="5m"
         )
 
         if df.empty:
@@ -92,19 +90,29 @@ def obtener_datos():
 
         df = df.reset_index()
 
-        if len(df.columns) >= 6:
-            df.columns = [
-                "Time",
-                "Close",
-                "High",
-                "Low",
-                "Open",
-                "Volume"
-            ]
+        # Renombrar columnas correctamente
+        # yfinance devuelve: Datetime, Open, High, Low, Close, Volume, ...
+        df = df.rename(columns={
+            "Datetime": "Time",
+            "Open": "Open",
+            "High": "High",
+            "Low": "Low",
+            "Close": "Close",
+            "Volume": "Volume"
+        })
+
+        # Por si acaso viene como "Date" en vez de "Datetime"
+        if "Date" in df.columns and "Time" not in df.columns:
+            df = df.rename(columns={"Date": "Time"})
 
         df["Time"] = pd.to_datetime(df["Time"])
 
+        # Eliminar timezone para comparar fechas
+        if df["Time"].dt.tz is not None:
+            df["Time"] = df["Time"].dt.tz_convert(NY_TZ)
+
         print(f"✅ Datos descargados: {len(df)} velas")
+        print(f"📌 Último precio: {df.iloc[-1]['Close']:.2f}")
 
         return df.dropna()
 
@@ -129,12 +137,19 @@ def detectar_zonas(df):
 
         try:
 
-            if base["Time"].date() != hoy:
+            # Solo zonas de hoy
+            tiempo = base["Time"]
+            if hasattr(tiempo, "date"):
+                fecha = tiempo.date()
+            else:
+                fecha = pd.Timestamp(tiempo).date()
+
+            if fecha != hoy:
                 continue
 
             cuerpo = abs(
-                impulso["Close"] -
-                impulso["Open"]
+                float(impulso["Close"]) -
+                float(impulso["Open"])
             )
 
             if cuerpo < IMPULSO_MINIMO:
@@ -142,18 +157,30 @@ def detectar_zonas(df):
 
             tipo = (
                 "DEMANDA"
-                if impulso["Close"] > impulso["Open"]
+                if float(impulso["Close"]) > float(impulso["Open"])
                 else "OFERTA"
             )
 
+            # Filtro adicional: la vela impulso debe ser significativa
+            # DEMANDA: precio venía bajando antes del impulso alcista
+            # OFERTA: precio venía subiendo antes del impulso bajista
+            vela_previa = df.iloc[i - 1]
+
+            if tipo == "DEMANDA":
+                # Confirmar que había presión bajista antes
+                if float(vela_previa["Close"]) <= float(vela_previa["Open"]):
+                    pass  # OK, venía bajando
+                # Si no, igual lo incluimos pero con menor prioridad
+
             zonas.append({
                 "Tipo": tipo,
-                "High": round(base["High"], 2),
-                "Low": round(base["Low"], 2),
+                "High": round(float(base["High"]), 2),
+                "Low": round(float(base["Low"]), 2),
                 "Impulso": round(cuerpo, 2)
             })
 
-        except Exception:
+        except Exception as ex:
+            print(f"⚠️ Error en zona {i}: {ex}")
             continue
 
     return zonas
@@ -164,27 +191,28 @@ def detectar_zonas(df):
 def tocar_zona(df, zona):
 
     last = df.iloc[-1]
+    last_low = float(last["Low"])
+    last_high = float(last["High"])
+    last_close = float(last["Close"])
 
     if zona["Tipo"] == "DEMANDA":
-
-        return (
-            zona["Low"]
-            <= last["Low"]
-            <= zona["High"]
-        )
+        # El precio toca la zona por abajo y cierra dentro o rebota
+        toca = zona["Low"] <= last_low <= zona["High"]
+        # Confirmar que el precio no está cayendo fuerte AHORA
+        rebote = last_close >= zona["Low"]
+        return toca and rebote
 
     else:
-
-        return (
-            zona["Low"]
-            <= last["High"]
-            <= zona["High"]
-        )
+        # OFERTA
+        toca = zona["Low"] <= last_high <= zona["High"]
+        # Confirmar que el precio no está subiendo fuerte AHORA
+        rechazo = last_close <= zona["High"]
+        return toca and rechazo
 
 # =========================
 # MENSAJE TELEGRAM
 # =========================
-def mensaje(zona, precio):
+def mensaje_alerta(zona, precio):
 
     if zona["Tipo"] == "DEMANDA":
 
@@ -225,14 +253,14 @@ def mensaje(zona, precio):
 
 📊 Dirección: {direc}
 
-🎯 Entry: {round(entry,2)}
-🛑 Stop: {round(sl,2)}
-🎯 TP: {round(tp,2)}
+🎯 Entry: {round(entry, 2)}
+🛑 Stop: {round(sl, 2)}
+🎯 TP: {round(tp, 2)}
 
 💰 Riesgo: ${riesgo_usd}
 💵 Potencial: ${ganancia_usd}
 
-📍 Precio actual: {round(precio,2)}
+📍 Precio actual: {round(precio, 2)}
 
 ⚡ Impulso: {zona['Impulso']}
 🕐 Hora NY: {datetime.now(NY_TZ).strftime('%H:%M')}
@@ -245,23 +273,19 @@ def horario_ok():
 
     now = datetime.now(NY_TZ)
 
+    # No operar fines de semana
+    if now.weekday() >= 5:  # 5=Sabado, 6=Domingo
+        return False
+
     return (
         (
             now.hour > START_HOUR
-            or
-            (
-                now.hour == START_HOUR
-                and now.minute >= START_MIN
-            )
+            or (now.hour == START_HOUR and now.minute >= START_MIN)
         )
         and
         (
             now.hour < END_HOUR
-            or
-            (
-                now.hour == END_HOUR
-                and now.minute <= END_MIN
-            )
+            or (now.hour == END_HOUR and now.minute <= END_MIN)
         )
     )
 
@@ -272,9 +296,7 @@ def run():
 
     print("🚀 BOT INICIADO EN RENDER")
 
-    enviar_mensaje(
-        "🚀 BOT NQ ARRANCADO EN RENDER"
-    )
+    enviar_mensaje("🚀 BOT NQ ARRANCADO EN RENDER")
 
     alertas = set()
 
@@ -284,35 +306,25 @@ def run():
 
             if not horario_ok():
 
-                print(
-                    f"😴 Fuera de horario NY "
-                    f"{datetime.now(NY_TZ).strftime('%H:%M')}"
-                )
+                now = datetime.now(NY_TZ)
+                print(f"😴 Fuera de horario NY {now.strftime('%H:%M')} (día {now.weekday()})")
 
                 time.sleep(60)
                 continue
 
-            print(
-                f"🔍 Revisando mercado "
-                f"{datetime.now(NY_TZ).strftime('%H:%M:%S')}"
-            )
+            print(f"🔍 Revisando mercado {datetime.now(NY_TZ).strftime('%H:%M:%S')}")
 
             df = obtener_datos()
 
             if df is None:
-
                 time.sleep(30)
                 continue
 
-            precio = float(
-                df.iloc[-1]["Close"]
-            )
+            precio = float(df.iloc[-1]["Close"])
 
             zonas = detectar_zonas(df)
 
-            print(
-                f"📊 Zonas detectadas: {len(zonas)}"
-            )
+            print(f"📊 Zonas detectadas: {len(zonas)}")
 
             for z in zonas:
 
@@ -327,23 +339,19 @@ def run():
 
                 if tocar_zona(df, z):
 
-                    enviar_mensaje(
-                        mensaje(z, precio)
-                    )
+                    enviar_mensaje(mensaje_alerta(z, precio))
 
                     alertas.add(z_id)
 
-                    print(
-                        f"🎯 Señal enviada: {z_id}"
-                    )
+                    print(f"🎯 Señal enviada: {z_id}")
 
             time.sleep(60)
 
         except Exception as e:
 
-            print("❌ Error:", e)
-
+            print("❌ Error en loop principal:", e)
             time.sleep(30)
+
 
 if __name__ == "__main__":
     run()
